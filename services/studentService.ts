@@ -113,11 +113,19 @@ export const getStudentByRollNumber = async (rollNumber: string): Promise<Studen
 };
 
 export const getStudentById = async (id: string): Promise<Student | null> => {
+  if (!id || typeof id !== 'string') return null;
+
   if (isSupabaseConfigured()) {
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id.trim());
+    if (!isUuid) {
+      // Non-UUID ID in Supabase returns null to allow fallback to roll_number lookup
+      return null;
+    }
+
     const { data, error } = await supabase
       .from('students')
       .select('*')
-      .eq('id', id)
+      .eq('id', id.trim())
       .maybeSingle();
 
     if (error) {

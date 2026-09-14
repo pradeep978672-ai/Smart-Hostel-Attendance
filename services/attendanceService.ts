@@ -1,8 +1,10 @@
 import { supabase, isSupabaseConfigured } from '@/lib/supabase/client';
 import { AttendanceRecord, AttendanceStats, AttendanceStatus, AuthMethod, Student } from '@/types/database';
 import { getFormattedTodayDate, getAttendanceWindowStatus } from '@/lib/time';
-import { getAllStudents } from './studentService';
+import { getAllStudents, getStudentById, getStudentByRollNumber } from './studentService';
 import { getStoredAttendance, saveStoredAttendance, addStoredAuditLog } from './mockDataService';
+import { WebAuthnAssertionData, matchCredentialId } from '@/lib/webauthn';
+import { verifyPassword } from '@/lib/password';
 
 // ---------------------------------------------------------------------------
 // Runtime column cache — detects which optional columns exist in the live
@@ -88,6 +90,8 @@ export interface SubmitAttendancePayload {
   location_accuracy?: number;     // GPS accuracy radius in metres
   location_captured_at?: string;  // ISO timestamp of GPS capture on client
   auth_method: AuthMethod;
+  password?: string;
+  webauthn_assertion?: WebAuthnAssertionData;
   bypassTimeWindow?: boolean; // For dev testing mode
 }
 
@@ -125,38 +129,80 @@ export const checkDailySubmissionStatus = async (
 export const submitAttendance = async (
   payload: SubmitAttendancePayload
 ): Promise<AttendanceRecord> => {
-  const windowStatus = getAttendanceWindowStatus();
+  // If running in browser environment, submit through authoritative server API
+  if (typeof window !== 'undefined') {
+    const res = await fetch('/api/attendance/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || 'Failed to submit attendance.');
+    }
+    return data.record;
+  }
 
-  // Enforce 6:00 PM - 10:00 PM time window unless explicitly bypassed in dev test mode
+  // ── Authoritative validation fallback (for server-side / test runners) ────
+  const windowStatus = getAttendanceWindowStatus();
   if (!windowStatus.isOpen && !payload.bypassTimeWindow) {
     throw new Error(windowStatus.statusMessage);
   }
 
-  const today = getFormattedTodayDate();
+  const student =
+    (await getStudentById(payload.student_id)) ||
+    (await getStudentByRollNumber(payload.roll_number));
 
-  // Check duplicate submission on same day
+  if (!student) {
+    throw new Error('Student record not found in system.');
+  }
+
+  // Strict authentication verification
+  if (payload.auth_method === 'PASSWORD') {
+    if (!payload.password || !payload.password.trim()) {
+      throw new Error('Student password is required for attendance submission.');
+    }
+    if (!student.password_hash) {
+      throw new Error('Student has no configured password.');
+    }
+    const isPassValid = await verifyPassword(payload.password, student.password_hash);
+    if (!isPassValid) {
+      throw new Error('Incorrect student password. Attendance submission rejected.');
+    }
+  } else if (payload.auth_method === 'WEBAUTHN_PASSKEY') {
+    if (!payload.webauthn_assertion) {
+      throw new Error('WebAuthn biometric assertion is required for passkey attendance submission.');
+    }
+    if (!student.has_webauthn || !student.webauthn_credential_id) {
+      throw new Error(`No registered WebAuthn passkey found for student "${student.name}".`);
+    }
+    if (!matchCredentialId(payload.webauthn_assertion.credentialId, student.webauthn_credential_id)) {
+      throw new Error('WebAuthn credential mismatch. Assertion does not match the student’s registered passkey.');
+    }
+  } else {
+    throw new Error('Invalid authentication method specified.');
+  }
+
+  const today = getFormattedTodayDate();
   const { hasSubmitted } = await checkDailySubmissionStatus(payload.student_id, today);
   if (hasSubmitted) {
     throw new Error('You have already submitted your attendance for today!');
   }
 
+  const lat = payload.location_lat;
+  const lng = payload.location_lng;
+  const acc = payload.location_accuracy;
+
+  if (lat == null || lng == null) {
+    throw new Error('GPS location is required to submit attendance.');
+  }
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    throw new Error('Invalid GPS coordinates received. Please retry.');
+  }
+
+  const locationReviewStatus = acc == null || acc > 500 ? 'NEEDS_REVIEW' : 'VERIFIED';
+
   if (isSupabaseConfigured()) {
-    // ── Server-side location validation ─────────────────────────────────
-    const lat = payload.location_lat;
-    const lng = payload.location_lng;
-    const acc = payload.location_accuracy;
-
-    if (lat == null || lng == null) {
-      throw new Error('GPS location is required to submit attendance.');
-    }
-    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-      throw new Error('Invalid GPS coordinates received. Please retry.');
-    }
-
-    // Flag if accuracy is very poor (>500 m)
-    const locationReviewStatus =
-      acc == null || acc > 500 ? 'NEEDS_REVIEW' : 'VERIFIED';
-
     const existingCols = await getAttendanceColumns();
 
     const insertObj: Record<string, unknown> = {
@@ -219,15 +265,19 @@ export const submitAttendance = async (
     date: today,
     submission_time: new Date().toISOString(),
     status: 'PRESENT',
-    latitude: payload.location_lat ?? 0,
-    longitude: payload.location_lng ?? 0,
-    location_lat: payload.location_lat ?? 0,
-    location_lng: payload.location_lng ?? 0,
+    latitude: lat,
+    longitude: lng,
+    location_lat: lat,
+    location_lng: lng,
     location_address: payload.location_address ?? 'Hostel Campus',
+    location_accuracy: acc ?? null,
+    location_captured_at: payload.location_captured_at ?? new Date().toISOString(),
+    location_review_status: locationReviewStatus,
     selfie_url: payload.selfie_photo,
     selfie_photo: payload.selfie_photo,
     auth_method: payload.auth_method,
     created_at: new Date().toISOString(),
+    student: student,
   };
 
   const list = getStoredAttendance();

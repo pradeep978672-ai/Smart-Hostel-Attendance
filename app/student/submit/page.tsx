@@ -8,7 +8,7 @@ import { submitAttendance, checkDailySubmissionStatus } from '@/services/attenda
 import { CameraCapture } from '@/components/attendance/CameraCapture';
 import { LocationPicker } from '@/components/attendance/LocationPicker';
 import { GeoLocationResult, getCurrentLocation } from '@/lib/geolocation';
-import { verifyWebAuthnPasskey } from '@/lib/webauthn';
+import { authenticateWithWebAuthn, WebAuthnAssertionData } from '@/lib/webauthn';
 import { getAttendanceWindowStatus } from '@/lib/time';
 import {
   Clock,
@@ -20,6 +20,7 @@ import {
   CheckCircle2,
   AlertCircle,
   MapPin,
+  Lock,
 } from 'lucide-react';
 import Link from 'next/link';
 
@@ -31,7 +32,9 @@ export default function AttendanceSubmitPage() {
   const [selfiePhoto, setSelfiePhoto] = useState<string>('');
   const [locationReady, setLocationReady] = useState<boolean>(false); // GPS status (pre-fetch)
   const [locationError, setLocationError] = useState<string>('');     // GPS error message
-  const [authMethod, setAuthMethod] = useState<'PASSWORD' | 'WEBAUTHN_PASSKEY'>('WEBAUTHN_PASSKEY');
+  const [authMethod, setAuthMethod] = useState<'PASSWORD' | 'WEBAUTHN_PASSKEY'>(
+    currentStudent?.has_webauthn ? 'WEBAUTHN_PASSKEY' : 'PASSWORD'
+  );
   const [password, setPassword] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [alreadySubmitted, setAlreadySubmitted] = useState<boolean>(false);
@@ -50,6 +53,9 @@ export default function AttendanceSubmitPage() {
       checkDailySubmissionStatus(currentStudent.id).then((res) => {
         if (res.hasSubmitted) setAlreadySubmitted(true);
       });
+      if (!currentStudent.has_webauthn) {
+        setAuthMethod('PASSWORD');
+      }
     }
   }, [currentStudent]);
 
@@ -88,11 +94,24 @@ export default function AttendanceSubmitPage() {
       return;
     }
 
+    // ── Validate Authentication Input Before Submission ──────────────────
+    if (authMethod === 'PASSWORD') {
+      if (!password || !password.trim()) {
+        setErrorMsg('Please enter your student password to verify identity.');
+        showToast('error', 'Password Required', 'Student password is required to submit attendance.');
+        return;
+      }
+    } else if (authMethod === 'WEBAUTHN_PASSKEY') {
+      if (!currentStudent.has_webauthn || !currentStudent.webauthn_credential_id) {
+        setErrorMsg('No WebAuthn passkey registered for your account. Please use password authentication.');
+        showToast('error', 'Passkey Not Registered', 'Please switch to Password authentication.');
+        return;
+      }
+    }
+
     setIsSubmitting(true);
 
     // ── Fresh GPS capture at the moment of submission ─────────────────────
-    // This is the authoritative location. We always re-fetch rather than
-    // reusing the pre-fetched preview to get the most accurate timestamp.
     let capturedLocation: GeoLocationResult;
     try {
       capturedLocation = await getCurrentLocation();
@@ -104,15 +123,42 @@ export default function AttendanceSubmitPage() {
       return;
     }
 
-    try {
-      if (authMethod === 'WEBAUTHN_PASSKEY') {
-        try {
-          await verifyWebAuthnPasskey(currentStudent.webauthn_credential_id || undefined);
-        } catch {
-          // Fallback: allow if browser environment lacks hardware passkey
-        }
+    // ── Authenticate via WebAuthn Biometrics if selected ──────────────────
+    let assertion: WebAuthnAssertionData | undefined = undefined;
+    if (authMethod === 'WEBAUTHN_PASSKEY') {
+      if (!currentStudent.webauthn_credential_id) {
+        setErrorMsg('No WebAuthn passkey registered for your account. Please use password authentication.');
+        showToast('error', 'Passkey Not Registered', 'Please switch to Password authentication.');
+        setIsSubmitting(false);
+        return;
       }
 
+      try {
+        let challenge: string | undefined;
+        try {
+          const chalRes = await fetch('/api/auth/webauthn/challenge');
+          if (chalRes.ok) {
+            const chalData = await chalRes.json();
+            challenge = chalData.challenge;
+          }
+        } catch {
+          // Fallback handled in authenticateWithWebAuthn
+        }
+
+        assertion = await authenticateWithWebAuthn(
+          currentStudent.webauthn_credential_id,
+          challenge
+        );
+      } catch (passkeyErr: any) {
+        const msg = passkeyErr?.message || 'Biometric passkey authentication failed or was cancelled.';
+        setErrorMsg(msg);
+        showToast('error', 'Biometric Authentication Failed', msg);
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    try {
       await submitAttendance({
         student_id: currentStudent.id,
         roll_number: currentStudent.roll_number,
@@ -123,6 +169,8 @@ export default function AttendanceSubmitPage() {
         location_accuracy: capturedLocation.accuracy,
         location_captured_at: capturedLocation.capturedAt,
         auth_method: authMethod,
+        password: authMethod === 'PASSWORD' ? password : undefined,
+        webauthn_assertion: authMethod === 'WEBAUTHN_PASSKEY' ? assertion : undefined,
         bypassTimeWindow: devTimeWindowBypass,
       });
 
@@ -130,7 +178,7 @@ export default function AttendanceSubmitPage() {
       router.push('/student/history');
     } catch (err: any) {
       setErrorMsg(err.message || 'Failed to submit attendance.');
-      showToast('error', 'Submission Blocked', err.message || 'Duplicate submission or window restriction.');
+      showToast('error', 'Submission Rejected', err.message || 'Authentication or validation failed.');
     } finally {
       setIsSubmitting(false);
     }
@@ -201,8 +249,6 @@ export default function AttendanceSubmitPage() {
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-300">
               2. GPS Location *
             </label>
-            {/* LocationPicker is a UX status indicator — coordinates are
-                re-captured fresh at submit time via getCurrentLocation(). */}
             <LocationPicker
               onLocationCaptured={() => {
                 setLocationReady(true);
@@ -216,7 +262,7 @@ export default function AttendanceSubmitPage() {
             {isSubmitting && (
               <div className="flex items-center gap-2 text-xs text-brand-300 px-1">
                 <MapPin className="w-3.5 h-3.5 animate-pulse" />
-                Re-capturing GPS at submission time…
+                Re-capturing GPS & verifying authentication…
               </div>
             )}
           </div>
@@ -252,14 +298,44 @@ export default function AttendanceSubmitPage() {
             </div>
 
             {authMethod === 'PASSWORD' && (
-              <div>
-                <input
-                  type="password"
-                  placeholder="Enter Student Password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-slate-100 text-xs focus:outline-none focus:ring-2 focus:ring-brand-500/40"
-                />
+              <div className="space-y-1.5">
+                <label className="block text-[11px] font-medium text-slate-400">
+                  Student Account Password:
+                </label>
+                <div className="relative">
+                  <input
+                    type="password"
+                    placeholder="Enter Student Password to Verify"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    required
+                    className="w-full pl-9 pr-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-slate-100 text-xs focus:outline-none focus:ring-2 focus:ring-brand-500/40"
+                  />
+                  <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                </div>
+                <p className="text-[10px] text-slate-500">
+                  Your password will be authoritatively verified by the server before recording attendance.
+                </p>
+              </div>
+            )}
+
+            {authMethod === 'WEBAUTHN_PASSKEY' && !currentStudent.has_webauthn && (
+              <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-amber-300 text-xs flex flex-col gap-1.5">
+                <span>No biometric passkey registered for your student account.</span>
+                <button
+                  type="button"
+                  onClick={() => setAuthMethod('PASSWORD')}
+                  className="inline-flex items-center gap-1 font-bold underline text-brand-300 hover:text-white text-left"
+                >
+                  <Key className="w-3 h-3" /> Switch to Password Authentication
+                </button>
+              </div>
+            )}
+
+            {authMethod === 'WEBAUTHN_PASSKEY' && currentStudent.has_webauthn && (
+              <div className="p-3 bg-purple-500/10 border border-purple-500/30 rounded-xl text-purple-300 text-xs flex items-center gap-2">
+                <Fingerprint className="w-4 h-4 shrink-0 text-purple-400" />
+                <span>Device biometric ceremony (Touch ID / Face ID / Windows Hello) will activate when you click submit.</span>
               </div>
             )}
           </div>
@@ -272,7 +348,7 @@ export default function AttendanceSubmitPage() {
           >
             {isSubmitting ? (
               <>
-                <Loader2 className="w-5 h-5 animate-spin" /> Capturing location & submitting…
+                <Loader2 className="w-5 h-5 animate-spin" /> Verifying authentication & submitting…
               </>
             ) : (
               <>

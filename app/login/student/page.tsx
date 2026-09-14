@@ -1,22 +1,33 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthContext';
 import { useToast } from '@/context/ToastContext';
-import { verifyWebAuthnPasskey } from '@/lib/webauthn';
+import {
+  isWebAuthnSupported,
+  authenticateWithWebAuthn,
+  verifyWebAuthnAssertion,
+} from '@/lib/webauthn';
+import { getStudentByRollNumber } from '@/services/studentService';
 import { GraduationCap, Key, Fingerprint, Loader2, User, ArrowLeft } from 'lucide-react';
 import Link from 'next/link';
 
 export default function StudentLoginPage() {
   const router = useRouter();
-  const { loginAsStudent } = useAuth();
+  const { loginAsStudent, loginWithVerifiedWebAuthn, logout } = useAuth();
   const { showToast } = useToast();
 
   const [rollNumber, setRollNumber] = useState('2024-CS-001');
   const [password, setPassword] = useState('Student@123');
   const [isLoading, setIsLoading] = useState(false);
   const [isPasskeyLoading, setIsPasskeyLoading] = useState(false);
+
+  // Clear any existing session when accessing the login page
+  useEffect(() => {
+    logout();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handlePasswordLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -42,26 +53,79 @@ export default function StudentLoginPage() {
   };
 
   const handlePasskeyLogin = async () => {
-    const cleanRoll = rollNumber.trim();
+    const cleanRoll = rollNumber.trim().toUpperCase();
     if (!cleanRoll) {
       showToast('error', 'Required Field', 'Please enter your Student Roll Number first.');
       return;
     }
+
+    if (!isWebAuthnSupported()) {
+      showToast(
+        'error',
+        'WebAuthn Unsupported',
+        'Your browser or device does not support WebAuthn Passkeys / Biometrics. Please use your password to log in.'
+      );
+      return;
+    }
+
     setIsPasskeyLoading(true);
     try {
-      await verifyWebAuthnPasskey();
-      const ok = await loginAsStudent(cleanRoll, 'passkey-auth');
+      // 1. Fetch student by roll number to check existence and registered credential
+      const student = await getStudentByRollNumber(cleanRoll);
+      if (!student) {
+        showToast('error', 'Student Not Found', `No student account found with Roll Number "${cleanRoll}".`);
+        return;
+      }
+
+      // 2. Validate registered WebAuthn credential exists
+      if (!student.has_webauthn || !student.webauthn_credential_id) {
+        showToast(
+          'error',
+          'No Passkey Registered',
+          `No WebAuthn passkey has been registered for student "${student.name}" (${cleanRoll}). Please log in with your password.`
+        );
+        return;
+      }
+
+      // 3. Request server cryptographic challenge
+      const challengeRes = await fetch('/api/auth/webauthn/challenge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rollNumber: cleanRoll }),
+      });
+
+      if (!challengeRes.ok) {
+        const errData = await challengeRes.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to obtain WebAuthn challenge from server.');
+      }
+
+      const challengeData = await challengeRes.json();
+      const serverChallenge = challengeData.challenge;
+
+      // 4. Perform genuine WebAuthn authentication ceremony with the device
+      const assertion = await authenticateWithWebAuthn(
+        student.webauthn_credential_id,
+        serverChallenge
+      );
+
+      // 5. Verify returned assertion with the server
+      const verifyRes = await verifyWebAuthnAssertion(cleanRoll, assertion, serverChallenge);
+      if (!verifyRes.success) {
+        throw new Error(verifyRes.error || 'WebAuthn assertion verification failed.');
+      }
+
+      // 6. Establish student session ONLY after successful verification
+      const ok = await loginWithVerifiedWebAuthn(student, assertion.credentialId);
       if (ok) {
-        showToast('success', 'Biometric Passkey Verified!', 'WebAuthn biometric login successful.');
+        showToast('success', 'Biometric Passkey Verified!', `Welcome back, ${student.name}! Biometric login successful.`);
         router.push('/student/dashboard');
       } else {
-        showToast('error', 'Passkey Error', 'No active passkey account found for this Roll Number.');
+        throw new Error('Failed to create authenticated student session.');
       }
     } catch (err: any) {
-      showToast('info', 'Passkey Notice', err.message || 'Passkey verification process completed.');
-      // Auto fallback login for seamless demonstration
-      await loginAsStudent(cleanRoll, 'passkey-auth');
-      router.push('/student/dashboard');
+      // Strictly fail: NEVER log the student in on error, cancellation, or failure
+      const errorMsg = err.message || 'Passkey verification failed.';
+      showToast('error', 'Passkey Login Failed', `${errorMsg} You remain logged out.`);
     } finally {
       setIsPasskeyLoading(false);
     }
